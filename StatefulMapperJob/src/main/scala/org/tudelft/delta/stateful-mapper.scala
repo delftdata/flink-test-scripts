@@ -4,7 +4,7 @@ import java.util.{Properties, UUID}
 
 import org.apache.flink.api.common.functions.{MapFunction, RichMapFunction}
 import org.apache.flink.api.common.serialization.SimpleStringSchema
-import org.apache.flink.api.common.state.{ListState, ListStateDescriptor}
+import org.apache.flink.api.common.state.{ValueState, ValueStateDescriptor}
 import org.apache.flink.api.java.utils.ParameterTool
 import org.apache.flink.api.scala.ExecutionEnvironment
 import org.apache.flink.configuration.Configuration
@@ -22,7 +22,6 @@ object BenchmarkMapper {
 
     val cons = new FlinkKafkaConsumer011(inputTopicName, new SimpleStringSchema(), properties)
     cons.setStartFromEarliest()
-    cons
   }
 
   def kafkaSink(properties: Properties): SinkFunction[String] = {
@@ -50,19 +49,19 @@ object BenchmarkMapper {
 
     val parallelism = params.getInt("experiment-parallelism")
 
-    val sourceStream : DataStream[String] = env.addSource(kafkaSrc(props)).setParallelism(parallelism).disableChaining()
+    val sourceStream : DataStream[String] = env.addSource(kafkaSrc(props)).setParallelism(parallelism).disableChaining().slotSharingGroup(UUID.randomUUID().toString)
     val keyedSourceStream = sourceStream.keyBy(s => if (s.toLowerCase.length > 0) s.charAt(0) else 'z')
 
     val depth = params.getInt("experiment-depth")
     var streams : List[DataStream[String]] = List.empty
     streams = streams :+ keyedSourceStream
     for(i <- 1 to depth){
-      val newStream =  streams.last.map(new BenchmarkStatefulMapper(props)).setParallelism(parallelism).disableChaining() //Stateful
-      //val newStream =  streams.last.map(x => x).setParallelism(parallelism).disableChaining()                               //Stateless
+      val newStream =  streams.last.map(new BenchmarkStatefulMapper(props)).setParallelism(parallelism).disableChaining().slotSharingGroup(UUID.randomUUID().toString) //Stateful
+      //val newStream =  streams.last.map(x => x).setParallelism(parallelism).disableChaining().slotSharingGroup(UUID.randomUUID())                               //Stateless
       val keyedNewStream = newStream.keyBy(s => if (s.toLowerCase.length > 0) s.charAt(0) else 'z')
       streams = streams :+ keyedNewStream
     }
-    val sink = streams.last.addSink(kafkaSink(props)).setParallelism(parallelism).disableChaining()
+    val sink = streams.last.addSink(kafkaSink(props)).setParallelism(parallelism).disableChaining().slotSharingGroup(UUID.randomUUID().toString)
     // execute program
     env.execute("Streaming HA Benchmark")
   }
@@ -70,33 +69,27 @@ object BenchmarkMapper {
 
 class BenchmarkStatefulMapper(properties: Properties) extends RichMapFunction[String, String] {
 
-  var state: ListState[Array[Byte]] = _
+  var state: ValueState[Array[Byte]] = _
   val sleepTime = properties.getProperty("sleep", "1").toLong
-  val segmentSize = properties.getProperty("segment-size", "10000").toInt
 
   val stateSize = properties.getProperty("experiment-state-size").toInt
   val parallelism = properties.getProperty("experiment-parallelism").toInt
+  val stateSizePerSubtaskPerKey = (stateSize.toFloat / parallelism / 27).toInt
 
   override def open(parameters: Configuration): Unit = {
     super.open(parameters)
-    state = getRuntimeContext.getListState(new ListStateDescriptor[Array[Byte]]("state", createTypeInformation[Array[Byte]]))
+    state = getRuntimeContext.getState(new ValueStateDescriptor[Array[Byte]]("state", createTypeInformation[Array[Byte]]))
   }
 
 
   override def map(value: String): String = {
     //Initialize state
-    if(! state.get().iterator().hasNext){
+    val currState = state.value()
+    if(currState == null){
       //Share load with other parallel instances
-      val stateSizePerOperatorPerKey = (stateSize.toFloat / parallelism / 27).toInt
-
-      // Fill with segments
-      for(i <- 1 to (stateSizePerOperatorPerKey / segmentSize))
-        state.add(Array.fill(segmentSize)((scala.util.Random.nextInt(256) - 128).toByte))
-      // Fill remainder
-      state.add(Array.fill(stateSizePerOperatorPerKey % segmentSize)((scala.util.Random.nextInt(256) - 128).toByte))
+      state.update(Array.fill(stateSizePerSubtaskPerKey)((scala.util.Random.nextInt(256) - 128).toByte))
     }else {
       Thread.sleep(sleepTime)
-
     }
     value
   }

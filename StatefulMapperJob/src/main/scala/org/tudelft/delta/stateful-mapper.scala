@@ -42,10 +42,10 @@ object BenchmarkMapper {
 
     //env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);
     //env.setStateBackend(new RocksDBStateBackend(stateDir, false))
-    env.enableCheckpointing(params.getInt("experiment-checkpoint-interval-ms"))// start a checkpoint every 2seconds
-    val config = env.getCheckpointConfig
-    config.setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE)// set mode to exactly-once (this is the default)
-    config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION)
+    //env.enableCheckpointing(params.getInt("experiment-checkpoint-interval-ms"))// start a checkpoint every 2seconds
+    //val config = env.getCheckpointConfig
+    //config.setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE)// set mode to exactly-once (this is the default)
+    //config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION)
 
     val parallelism = params.getInt("experiment-parallelism")
 
@@ -67,14 +67,23 @@ object BenchmarkMapper {
   }
 }
 
+/*
+ * For each key (a-z) provide the full amount of requested state.
+ * Option "per-partition-state" set to false changes this behaviour, dividing by the parallelism
+ */
 class BenchmarkStatefulMapper(properties: Properties) extends RichMapFunction[String, String] {
 
   var state: ValueState[Array[Byte]] = _
   val sleepTime = properties.getProperty("sleep", "1").toLong
+  
+  val statePerPartition = properties.getProperty("per-partition-state", "true").toBoolean
 
   val stateSize = properties.getProperty("experiment-state-size").toInt
   val parallelism = properties.getProperty("experiment-parallelism").toInt
   val stateSizePerSubtaskPerKey = (stateSize.toFloat / parallelism / 27).toInt
+  val stateSizePerKey = (stateSize.toFloat / 27).toInt
+
+  val stateAmount = if(statePerPartition) stateSizePerKey else stateSizePerSubtaskPerKey
 
   override def open(parameters: Configuration): Unit = {
     super.open(parameters)
@@ -86,10 +95,11 @@ class BenchmarkStatefulMapper(properties: Properties) extends RichMapFunction[St
     //Initialize state
     val currState = state.value()
     if(currState == null){
-      //Share load with other parallel instances
-      state.update(Array.fill(stateSizePerSubtaskPerKey)((scala.util.Random.nextInt(256) - 128).toByte))
+      //Share load with other parallel instance
+      state.update(Array.fill(stateAmount)((scala.util.Random.nextInt(256) - 128).toByte))
     }else {
-      Thread.sleep(sleepTime)
+      if(sleepTime != 0)
+        Thread.sleep(sleepTime)
     }
     value
   }

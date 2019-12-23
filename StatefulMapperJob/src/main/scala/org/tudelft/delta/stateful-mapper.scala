@@ -4,10 +4,12 @@ import java.util.{Properties, UUID}
 
 import org.apache.flink.api.common.functions.{MapFunction, RichMapFunction}
 import org.apache.flink.api.common.serialization.SimpleStringSchema
-import org.apache.flink.api.common.state.{ValueState, ValueStateDescriptor}
+import org.apache.flink.api.common.state.{ListState, ListStateDescriptor, ValueState, ValueStateDescriptor}
 import org.apache.flink.api.java.utils.ParameterTool
 import org.apache.flink.api.scala.ExecutionEnvironment
 import org.apache.flink.configuration.Configuration
+import org.apache.flink.runtime.state.{FunctionInitializationContext, FunctionSnapshotContext}
+import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction
 import org.apache.flink.streaming.api.{CheckpointingMode, TimeCharacteristic}
 import org.apache.flink.streaming.api.environment.CheckpointConfig
 import org.apache.flink.streaming.api.functions.sink.SinkFunction
@@ -42,7 +44,7 @@ object BenchmarkMapper {
 
     //env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);
     //env.setStateBackend(new RocksDBStateBackend(stateDir, false))
-    //env.enableCheckpointing(params.getInt("experiment-checkpoint-interval-ms"))// start a checkpoint every 2seconds
+    env.enableCheckpointing(params.getInt("experiment-checkpoint-interval-ms"))// start a checkpoint every 2seconds
     //val config = env.getCheckpointConfig
     //config.setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE)// set mode to exactly-once (this is the default)
     //config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION)
@@ -50,16 +52,14 @@ object BenchmarkMapper {
     val parallelism = params.getInt("experiment-parallelism")
 
     val sourceStream : DataStream[String] = env.addSource(kafkaSrc(props)).setParallelism(parallelism).disableChaining().slotSharingGroup(UUID.randomUUID().toString)
-    val keyedSourceStream = sourceStream.keyBy(s => if (s.toLowerCase.length > 0) s.charAt(0) else 'z')
 
     val depth = params.getInt("experiment-depth")
     var streams : List[DataStream[String]] = List.empty
-    streams = streams :+ keyedSourceStream
+    streams = streams :+ sourceStream.rebalance
     for(i <- 1 to depth){
       val newStream =  streams.last.map(new BenchmarkStatefulMapper(props)).setParallelism(parallelism).disableChaining().slotSharingGroup(UUID.randomUUID().toString) //Stateful
       //val newStream =  streams.last.map(x => x).setParallelism(parallelism).disableChaining().slotSharingGroup(UUID.randomUUID())                               //Stateless
-      val keyedNewStream = newStream.keyBy(s => if (s.toLowerCase.length > 0) s.charAt(0) else 'z')
-      streams = streams :+ keyedNewStream
+      streams = streams :+  newStream.rebalance
     }
     val sink = streams.last.addSink(kafkaSink(props)).setParallelism(parallelism).disableChaining().slotSharingGroup(UUID.randomUUID().toString)
     // execute program
@@ -68,39 +68,33 @@ object BenchmarkMapper {
 }
 
 /*
- * For each key (a-z) provide the full amount of requested state.
+ * For each key provide the full amount of requested state.
  * Option "per-partition-state" set to false changes this behaviour, dividing by the parallelism
  */
-class BenchmarkStatefulMapper(properties: Properties) extends RichMapFunction[String, String] {
+class BenchmarkStatefulMapper(properties: Properties) extends MapFunction[String, String] with CheckpointedFunction {
 
-  var state: ValueState[Array[Byte]] = _
-  val sleepTime = properties.getProperty("sleep", "1").toLong
-  
+  var state: ListState[Array[Byte]] = _
+  val byteArray = Array.fill(stateAmount)((scala.util.Random.nextInt(256) - 128).toByte)
+  val sleepTime = properties.getProperty("sleep", "0").toLong
   val statePerPartition = properties.getProperty("per-partition-state", "true").toBoolean
-
   val stateSize = properties.getProperty("experiment-state-size").toInt
   val parallelism = properties.getProperty("experiment-parallelism").toInt
-  val stateSizePerSubtaskPerKey = (stateSize.toFloat / parallelism / 27).toInt
-  val stateSizePerKey = (stateSize.toFloat / 27).toInt
-
-  val stateAmount = if(statePerPartition) stateSizePerKey else stateSizePerSubtaskPerKey
-
-  override def open(parameters: Configuration): Unit = {
-    super.open(parameters)
-    state = getRuntimeContext.getState(new ValueStateDescriptor[Array[Byte]]("state", createTypeInformation[Array[Byte]]))
-  }
-
+  val stateAmount = if(statePerPartition) stateSize  else (stateSize / parallelism ).toInt
 
   override def map(value: String): String = {
-    //Initialize state
-    val currState = state.value()
-    if(currState == null){
-      //Share load with other parallel instance
-      state.update(Array.fill(stateAmount)((scala.util.Random.nextInt(256) - 128).toByte))
-    }else {
+      // Avoid issues with possibly the sleep(0) yielding the thread
       if(sleepTime != 0)
         Thread.sleep(sleepTime)
-    }
     value
+  }
+
+  override def snapshotState(context: FunctionSnapshotContext): Unit = {
+    state.clear()
+    state.add(byteArray) //Force a rewrite of the state, simulating changes of state
+  }
+
+  override def initializeState(context: FunctionInitializationContext): Unit = {
+    state = context.getOperatorStateStore.getListState(new ListStateDescriptor[Array[Byte]]("PerOperatorState", createTypeInformation[Array[Byte]]))
+    state.add(byteArray)
   }
 }

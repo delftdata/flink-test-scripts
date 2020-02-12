@@ -8,13 +8,12 @@ from random import randint, random, seed
 import sys
 from confluent_kafka.cimpl import Producer, KafkaError
 from confluent_kafka.cimpl import Consumer
+import statistics
 
 current_milli_time = lambda: int(round(time.time() * 1000))
 
 
-
-
-def exec_benchmark(duration_s, kafka_loc, output_topic):
+def exec_benchmark(duration_s, fps, kafka_loc, output_topic, silent):
     """Measures throughput at the output Kafka topic,
     by checking the growth in all partitions"""
 
@@ -36,19 +35,11 @@ def exec_benchmark(duration_s, kafka_loc, output_topic):
 
     c.subscribe([output_topic], on_assign=store_topic_partition)
     while topic_partitions is None:
-        c.consume(timeout=0.2)
+        c.consume(timeout=0.5)
 
     #Loop read partitions
-    fps = 1
 
 
-    MS_PER_UPDATE = 1000 / fps
-
-    start_time = current_milli_time()
-    last_time = start_time
-    current_time = start_time
-
-    lag = 0.0
 
     throughput_measured = []
     throughput_measured_per_partition = {}
@@ -57,7 +48,17 @@ def exec_benchmark(duration_s, kafka_loc, output_topic):
         low, high = c.get_watermark_offsets(p)
         throughput_measured_per_partition[p.partition] = []
         last_values[p.partition] = high
-        print("Starting value for partition {}: {}".format(p.partition, high))
+        if silent != "silent":
+            print("Starting value for partition {}: {}".format(p.partition, high))
+
+    MS_PER_UPDATE = 1000 / fps
+
+    start_time = current_milli_time()
+    last_time = start_time
+    current_time = start_time
+    last_write_time = current_time
+
+    lag = 0.0
 
     while current_time < start_time + duration_s * 1000:
         current_time = current_milli_time()
@@ -67,28 +68,32 @@ def exec_benchmark(duration_s, kafka_loc, output_topic):
         while lag >= MS_PER_UPDATE:
             #calc new val
             total_new = 0
-            for topic_part in topic_partitions:
-                low, high = c.get_watermark_offsets(topic_part)
+            curr_time_for_print = current_milli_time()
+            for p in topic_partitions:
+                low, high = c.get_watermark_offsets(p)
                 delta = high - last_values[p.partition]
                 total_new += delta
-                throughput_measured_per_partition[p.partition].append(delta / (MS_PER_UPDATE/1000))
+                throughput_measured_per_partition[p.partition].append((delta / ((curr_time_for_print - last_write_time)/1000), curr_time_for_print))
                 last_values[p.partition] = high
-            throughput_measured.append(total_new / (MS_PER_UPDATE/1000))
+            throughput_measured.append((total_new / ((curr_time_for_print - last_write_time)/1000), curr_time_for_print))
+            last_write_time = curr_time_for_print
 
             lag -= MS_PER_UPDATE
 
 
-    print(str(throughput_measured))
-    print("\n")
-    for p in topic_partitions:
-        print(str(p.partition) + ": " + str(throughput_measured_per_partition[p.partition]))
+    if silent != "silent":
+        print(str(throughput_measured))
+        print("\n")
+        for p in topic_partitions:
+            print(str(p.partition) + ": " + str(throughput_measured_per_partition[p.partition]))
 
+    print(int(statistics.mean([x[0] for x in throughput_measured if x[0] > 0.0])))
 
 def main():
-    if len(sys.argv) != 4:
-        print("Error! Usage: python3 {} duration_in_seconds kafka_bootstrap output_topic")
+    if len(sys.argv) != 6:
+        print("Error! Usage: python3 {} duration_in_seconds readings_per_second kafka_bootstrap output_topic")
         exit(1)
-    exec_benchmark(int(sys.argv[1]),sys.argv[2],sys.argv[3])
+    exec_benchmark(int(sys.argv[1]),int(sys.argv[2]), sys.argv[3],sys.argv[4], sys.argv[5])
 
 if __name__ == "__main__":
     main()

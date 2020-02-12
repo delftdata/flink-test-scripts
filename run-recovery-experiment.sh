@@ -36,6 +36,7 @@ zk_loc=0.0.0.0:$zk_port
 benchmarkers=$@
 
 frag_size=100
+sleep_time=0
 
 input_topic=benchmark-input
 output_topic=benchmark-output
@@ -94,6 +95,98 @@ kill_taskmanager() {
 
 }
 
+push_job() {
+    echo "Pushing job to Flink"
+	response=$(curl -sS -X POST -H "Expect:" -F "jarfile=@job-marios.jar" http://0.0.0.0:31234/jars/upload)
+	echo "Job submit: $response"
+	id=$(echo $response | jq '.filename' |  tr -d '"' | tr "/" "\n" | tail -n1)
+	return $id
+}
+
+measure_sustainable_throughput() {
+    ss=$1
+	cf=$2
+	p=$3
+	g=$4
+
+    id=$(push_job)
+    
+    response=$(curl -sS  -X POST --header "Content-Type: application/json;charset=UTF-8" --data "{\"programArgs\":\"--bootstrap.servers $kafka_bootstrap --experiment-state-size $ss --experiment-checkpoint-interval-ms $cf --experiment-state-fragment-size $frag_size --experiment-depth $g --experiment-parallelism $p --sleep $sleep_time\"}" "http://0.0.0.0:31234/jars/$id/run?allowNonRestoredState=false")
+
+    echo "Job run: $response"
+     ./distributed-producer.sh 120 5 2000000 $kafka_ext $input_topic  $benchmarkers &
+    sleep 50
+    max1=$(python3 ./throughput-measurer/Main.py  20 2 $kafka_ext $output_topic silent)
+    echo "Max1 at $max1 r/s"
+    max2=$(python3 ./throughput-measurer/Main.py  20 2 $kafka_ext $output_topic silent)
+    echo "Max2 at $max2 r/s"
+    max3=$(python3 ./throughput-measurer/Main.py  20 2 $kafka_ext $output_topic silent)
+    echo "Max3 at $max3 r/s"
+    max=$(echo -e "$max1\n$max2\n$max3" | sort -n -r | head -n1)
+    echo "Max at $max r/s"
+    
+    jobid=$(curl -sS -X GET "http://0.0.0.0:31234/jobs" |  jq  '.jobs[0].id' | tr -d '"')
+    echo "Canceling the job with id $jobid"
+    curl -sS -X PATCH "http://0.0.0.0:31234/jobs/$jobid?mode=cancel"
+    
+    kubectl delete pod $(kubectl get pod | grep flink | awk {'print $1'})
+	return $max
+}
+
+run_experiment() {
+    ss=$1
+	cf=$2
+	p=$3
+	g=$4
+	setting=$5
+	path=$6
+
+	clear_make_topics
+    id=$(push_job)
+
+	sustainable=$(echo "$setting * $max" | bc)
+	echo "Setting throughput at $sustainable r/s"
+	mkdir -p $path/$setting
+	echo $sustainable > $path/$setting/sustainable
+
+	response=$(curl -sS  -X POST --header "Content-Type: application/json;charset=UTF-8" --data "{\"programArgs\":\"--bootstrap.servers $kafka_bootstrap --experiment-state-size $ss --experiment-state-fragment-size $frag_size --experiment-checkpoint-interval-ms $cf --experiment-depth $g --experiment-parallelism $p --sleep $sleep_time\"}" "http://0.0.0.0:31234/jars/$id/run?allowNonRestoredState=false")
+	echo "Job run: $response"
+	sleep 5
+	jobid=$(curl -sS -X GET "http://0.0.0.0:31234/jobs" |  jq  '.jobs[0].id' | tr -d '"')
+
+	. ./distributed-producer.sh 200 5 $sustainable $kafka_ext $input_topic  $benchmarkers &
+	sleep 45
+	python3 ./throughput-measurer/Main.py  150 3 $kafka_ext $output_topic verbose > $path/$setting/throughput &
+    . ./latmeasurer.sh $jobid 0.1 1500 $g >> $path/$setting/latmeasured &
+
+	sleep 50
+	kill_taskmanager $jobid $path/$setting
+	sleep 115
+
+	response=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid")
+	vertex_ids=($(echo $response | jq '.vertices[] | .id'  |  tr -d '"'))
+
+	echo "Saving logs"
+	jobmanager=$(kubectl get pods | grep jobmanager | awk '{print $1}')
+	new_host=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[$index_to_kill]}/subtasks/0" | jq '.host' |  tr -d '"')
+	src_pod=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[0]}/subtasks/0" | jq '.host' |  tr -d '"')
+	sink_pod=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[$(( $g + 1 ))]}/subtasks/0" | jq '.host' |  tr -d '"')
+
+	echo "Canceling the job with id $jobid"
+	curl -sS -X PATCH "http://0.0.0.0:31234/jobs/$jobid?mode=cancel"
+
+	kubectl logs $jobmanager > $path/$setting/JOBMANAGER-LOGS
+	kubectl logs $new_host > $path/$setting/STANDBY-LOGS
+	kubectl logs $src_pod > $path/$setting/SRC-LOGS
+	kubectl logs $sink_pod > $path/$setting/SINK-LOGS
+
+	mkdir -p $path/$setting/logs
+	for pod in $(kubectl get pod | grep flink | awk {'print $1'}) ; do kubectl logs $pod > $path/$setting/logs/$pod ; done
+
+	kubectl delete pod $(kubectl get pod | grep flink | awk {'print $1'})
+
+}
+
 
 echo "Beggining experiments"
 #Start Benchmark
@@ -118,141 +211,16 @@ for cf in ${checkpoint_frequencies[@]} ; do
 					echo "   Input rate: Pull rate"
 
 
-					echo "Pushing job to Flink"
-					response=$(curl -sS -X POST -H "Expect:" -F "jarfile=@job-marios.jar" http://$flink_rpc/jars/upload)
-					echo "Job submit: $response"
-					id=$(echo $response | jq '.filename' |  tr -d '"' | tr "/" "\n" | tail -n1)
-					sleep 1
-
-					########## Find Sustainable
-					response=$(curl -sS  -X POST --header "Content-Type: application/json;charset=UTF-8" --data "{\"programArgs\":\"--bootstrap.servers $kafka_bootstrap --experiment-state-size $ss --experiment-checkpoint-interval-ms $cf --experiment-state-fragment-size $frag_size --experiment-depth $g --experiment-parallelism $p --sleep 0\"}" "http://$flink_rpc/jars/$id/run?allowNonRestoredState=false")
-					echo "Job run: $response"
-					 ./distributed-producer.sh 120 5 2000000 $kafka_ext $input_topic  $benchmarkers &
-					sleep 50
-					max1=$(python3 ./throughput-measurer/Main.py  20 2 $kafka_ext $output_topic silent)
-					echo "Max1 at $max1 r/s"
-					max2=$(python3 ./throughput-measurer/Main.py  20 2 $kafka_ext $output_topic silent)
-					echo "Max2 at $max2 r/s"
-					max3=$(python3 ./throughput-measurer/Main.py  20 2 $kafka_ext $output_topic silent)
-					echo "Max3 at $max3 r/s"
-					max=$(echo -e "$max1\n$max2\n$max3" | sort -n -r | head -n1)
-					echo "Max at $max r/s"
-
-					jobid=$(curl -sS -X GET "http://0.0.0.0:31234/jobs" |  jq  '.jobs[0].id' | tr -d '"')
-					echo "Canceling the job with id $jobid"
-					curl -sS -X PATCH "http://$flink_rpc/jobs/$jobid?mode=cancel"
-
-					kubectl delete pod $(kubectl get pod | grep flink | awk {'print $1'})
-					sleep 15
-
+					max=$(measure_sustainable_throughput $cf $ss $p $g)
 
 					########## Run throughput experiment
-					clear_make_topics
 
-					echo "Pushing job to Flink"
-					response=$(curl -sS -X POST -H "Expect:" -F "jarfile=@job-marios.jar" http://$flink_rpc/jars/upload)
-					echo "Job submit: $response"
-					id=$(echo $response | jq '.filename' |  tr -d '"' | tr "/" "\n" | tail -n1)
-					sleep 1
-
-					setting=0.9
-					sustainable=$(echo "$setting * $max" | bc)
-					echo "Setting throughput at $sustainable r/s"
-					mkdir -p $path/$setting
-					echo $sustainable > $path/$setting/sustainable
-
-					response=$(curl -sS  -X POST --header "Content-Type: application/json;charset=UTF-8" --data "{\"programArgs\":\"--bootstrap.servers $kafka_bootstrap --experiment-state-size $ss --experiment-state-fragment-size $frag_size --experiment-checkpoint-interval-ms $cf --experiment-depth $g --experiment-parallelism $p --sleep 0\"}" "http://$flink_rpc/jars/$id/run?allowNonRestoredState=false")
-					echo "Job run: $response"
-					sleep 20 #Make sure even large jobs get scheduled
-					jobid=$(curl -sS -X GET "http://0.0.0.0:31234/jobs" |  jq  '.jobs[0].id' | tr -d '"')
-
-					. ./distributed-producer.sh 200 5 $sustainable $kafka_ext $input_topic  $benchmarkers &
-					sleep 45
-					python3 ./throughput-measurer/Main.py  150 3 $kafka_ext $output_topic verbose > $path/$setting/throughput &
-				    	. ./latmeasurer.sh $jobid 0.1 1500 $g >> $path/$setting/latmeasured &
-
-					sleep 50
-					kill_taskmanager $jobid $path/$setting
-					sleep 115
-
-					response=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid")
-					vertex_ids=($(echo $response | jq '.vertices[] | .id'  |  tr -d '"'))
-
-					echo "Saving logs"
-					jobmanager=$(kubectl get pods | grep jobmanager | awk '{print $1}')
-					new_host=$(curl -sS -X GET "http://$flink_rpc/jobs/$jobid/vertices/${vertex_ids[$index_to_kill]}/subtasks/0" | jq '.host' |  tr -d '"')
-					src_pod=$(curl -sS -X GET "http://$flink_rpc/jobs/$jobid/vertices/${vertex_ids[0]}/subtasks/0" | jq '.host' |  tr -d '"')
-					sink_pod=$(curl -sS -X GET "http://$flink_rpc/jobs/$jobid/vertices/${vertex_ids[$(( $g + 1 ))]}/subtasks/0" | jq '.host' |  tr -d '"')
-
-					echo "Canceling the job with id $jobid"
-					curl -sS -X PATCH "http://$flink_rpc/jobs/$jobid?mode=cancel"
-
-					kubectl logs $jobmanager > $path/$setting/JOBMANAGER-LOGS
-					kubectl logs $new_host > $path/$setting/STANDBY-LOGS
-					kubectl logs $src_pod > $path/$setting/SRC-LOGS
-					kubectl logs $sink_pod > $path/$setting/SINK-LOGS
-
-					mkdir -p $path/$setting/logs
-					for pod in $(kubectl get pod | grep flink | awk {'print $1'}) ; do kubectl logs $pod > $path/$setting/logs/$pod ; done
-
-					kubectl delete pod $(kubectl get pod | grep flink | awk {'print $1'})
+				    run_experiment $cf $ss $p $g 0.9 $path
 					
 
 
 					########## Run latency experiment
-					clear_make_topics
-
-					echo "Pushing job to Flink"
-					response=$(curl -sS -X POST -H "Expect:" -F "jarfile=@job-marios.jar" http://$flink_rpc/jars/upload)
-					echo "Job submit: $response"
-					id=$(echo $response | jq '.filename' |  tr -d '"' | tr "/" "\n" | tail -n1)
-					sleep 1
-
-					setting=0.5
-					sustainable=$(echo "$setting * $max" | bc)
-					echo "Setting throughput at $sustainable r/s"
-					mkdir -p $path/$setting
-					echo $sustainable > $path/$setting/sustainable
-
-					response=$(curl -sS  -X POST --header "Content-Type: application/json;charset=UTF-8" --data "{\"programArgs\":\"--bootstrap.servers $kafka_bootstrap --experiment-state-size $ss --experiment-state-fragment-size $frag_size --experiment-checkpoint-interval-ms $cf --experiment-depth $g --experiment-parallelism $p --sleep 0\"}" "http://$flink_rpc/jars/$id/run?allowNonRestoredState=false")
-					echo "Job run: $response"
-					sleep 20 #Make sure even large jobs get scheduled
-					jobid=$(curl -sS -X GET "http://0.0.0.0:31234/jobs" |  jq  '.jobs[0].id' | tr -d '"')
-
-					. ./distributed-producer.sh 200 5 $sustainable $kafka_ext $input_topic  $benchmarkers &
-					sleep 45
-					python3 ./throughput-measurer/Main.py  150 3 $kafka_ext $output_topic verbose > $path/$setting/throughput &
-				    	. ./latmeasurer.sh $jobid 0.1 1500 $g >> $path/$setting/latmeasured &
-
-					sleep 50
-					kill_taskmanager $jobid $path/$setting
-					sleep 115
-
-					response=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid")
-					vertex_ids=($(echo $response | jq '.vertices[] | .id'  |  tr -d '"'))
-
-					echo "Saving logs"
-					jobmanager=$(kubectl get pods | grep jobmanager | awk '{print $1}')
-					new_host=$(curl -sS -X GET "http://$flink_rpc/jobs/$jobid/vertices/${vertex_ids[$index_to_kill]}/subtasks/0" | jq '.host' |  tr -d '"')
-					src_pod=$(curl -sS -X GET "http://$flink_rpc/jobs/$jobid/vertices/${vertex_ids[0]}/subtasks/0" | jq '.host' |  tr -d '"')
-					sink_pod=$(curl -sS -X GET "http://$flink_rpc/jobs/$jobid/vertices/${vertex_ids[$(( $g + 1 ))]}/subtasks/0" | jq '.host' |  tr -d '"')
-
-					echo "Canceling the job with id $jobid"
-					curl -sS -X PATCH "http://$flink_rpc/jobs/$jobid?mode=cancel"
-
-					kubectl logs $jobmanager > $path/$setting/JOBMANAGER-LOGS
-					kubectl logs $new_host > $path/$setting/STANDBY-LOGS
-					kubectl logs $src_pod > $path/$setting/SRC-LOGS
-					kubectl logs $sink_pod > $path/$setting/SINK-LOGS
-
-					mkdir -p $path/$setting/logs
-					for pod in $(kubectl get pod | grep flink | awk {'print $1'}) ; do kubectl logs $pod > $path/$setting/logs/$pod ; done
-					kubectl delete pod $(kubectl get pod | grep flink | awk {'print $1'})
-
-					
-					#Allow time for pods to reschedule
-					echo "Sleeping before restarting to give time to schedule new pods"
-					sleep 5
+				    run_experiment $cf $ss $p $g 0.5 $path
 
 				done
 			done

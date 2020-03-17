@@ -15,7 +15,7 @@ size=0
 for ip in $ips ; do
 	size=$(echo "$size + 1" | bc)
 done
-size=$(echo "$size + 1" | bc)
+#size=$(echo "$size + 1" | bc)
 
 throughput_per_node=$(echo "$throughput / $size" | bc)
 remainder=$(echo "$throughput % $size" | bc )
@@ -26,7 +26,7 @@ echo "Throughput per node: $throughput_per_node"
 echo "Num records per node: $num_records_per_node"
 
 for ip in $ips ; do
-		ssh -o StrictHostKeyChecking=no ubuntu@$ip "timeout $duration_seconds /home/ubuntu/kafka/bin/kafka-producer-perf-test.sh --topic $topic --num-records $num_records_per_node --throughput $throughput_per_node --producer-props bootstrap.servers=$kafka key.serializer=org.apache.kafka.common.serialization.StringSerializer value.serializer=org.apache.kafka.common.serialization.StringSerializer --payload-file /home/ubuntu/cracklib-small > /dev/null" & 
+		ssh -o StrictHostKeyChecking=no ubuntu@$ip "timeout $duration_seconds /home/ubuntu/kafka/bin/kafka-producer-perf-test.sh --topic $topic --num-records $num_records_per_node --throughput $throughput_per_node --producer-props bootstrap.servers=$kafka key.serializer=org.apache.kafka.common.serialization.StringSerializer value.serializer=org.apache.kafka.common.serialization.StringSerializer --payload-file /home/ubuntu/cracklib-small &> /dev/null" & 
 done
 
-timeout $duration_seconds /home/ubuntu/kafka/bin/kafka-producer-perf-test.sh --topic $topic --num-records $num_records_per_node --throughput $throughput_per_node --producer-props bootstrap.servers=$kafka key.serializer=org.apache.kafka.common.serialization.StringSerializer value.serializer=org.apache.kafka.common.serialization.StringSerializer --payload-file /home/ubuntu/cracklib-small
+#timeout $duration_seconds /home/ubuntu/kafka/bin/kafka-producer-perf-test.sh --topic $topic --num-records $num_records_per_node --throughput $throughput_per_node --producer-props bootstrap.servers=$kafka key.serializer=org.apache.kafka.common.serialization.StringSerializer value.serializer=org.apache.kafka.common.serialization.StringSerializer --payload-file /home/ubuntu/cracklib-small &> /dev/null

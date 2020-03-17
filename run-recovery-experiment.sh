@@ -13,15 +13,21 @@ declare -a parallelism_degrees
 declare -a input_rates
 
 # MB
-state_sizes=( 100 )
+state_sizes=( 100000000 500000000 1000000000)
 # Milliseconds
-checkpoint_frequencies=(1000)
+checkpoint_frequencies=(100 1000 10000)
 # Operators between source and sink
-graph_depths=( 1 )
+graph_depths=( 1 3 5 )
 # Degrees
-parallelism_degrees=( 20 )
+parallelism_degrees=( 1 5 10 20 )
 
-index_to_kill=1
+default_ss=10000000
+default_cf=1000
+default_p=5
+default_d=3
+default_kd=1
+default_st=0
+default_as=false
 
 attempts=1
 
@@ -35,153 +41,222 @@ zk_loc=0.0.0.0:$zk_port
 
 benchmarkers=$@
 
-frag_size=100
-sleep_time=0
 
 input_topic=benchmark-input
 output_topic=benchmark-output
 
+declare -a work_queue
+
+# Specify runs by pushing configurations to work_queue
+#access state
+work_queue[0]="$default_cf;$default_ss;$default_p;1;$default_kd;$default_st;$default_as;1000000"
+work_queue[1]="$default_cf;$default_ss;$default_p;5;$default_kd;$default_st;$default_as;1000000"
+work_queue[2]="$default_cf;$default_ss;$default_p;$default_d;$default_kd;$default_st;true;1000000"
+
+#1MB,100MB,1GB
+#work_queue[0]="$default_cf;1000000;$default_p;$default_d;$default_kd;$default_st;$default_as;1000000"
+#work_queue[0]="$default_cf;100000000;$default_p;$default_d;$default_kd;$default_st;$default_as;1000000"
+#work_queue[0]="$default_cf;1000000000;$default_p;$default_d;$default_kd;$default_st;$default_as;1000000"
+
 
 clear_make_topics() {
-	echo "Trying to clear topic"
+	local p=$1
+	echo "Trying to clear topic" >&2
 
-	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --add-config retention.ms=1000 --entity-name $input_topic
-	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --add-config retention.ms=1000 --entity-name $output_topic
-
-	sleep 5
-
-	echo "Remove deletion mechanism"
-
-	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --delete-config retention.ms --entity-name $input_topic
-	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --delete-config retention.ms --entity-name $output_topic
+	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --add-config retention.ms=1000 --entity-name $input_topic >&2
+	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --add-config retention.ms=1000 --entity-name $output_topic >&2
 
 	sleep 5
-	echo "Now delete topic"
 
-	./kafka/bin/kafka-topics.sh --zookeeper $zk_loc --topic $input_topic --delete 
+	echo "Remove deletion mechanism" >&2
 
-	./kafka/bin/kafka-topics.sh --zookeeper $zk_loc --topic $output_topic --delete 
+	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --delete-config retention.ms --entity-name $input_topic >&2
+	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --delete-config retention.ms --entity-name $output_topic >&2
+
+	sleep 5
+	echo "Now delete topic" >&2
+
+	./kafka/bin/kafka-topics.sh --zookeeper $zk_loc --topic $input_topic --delete >&2 
+
+	./kafka/bin/kafka-topics.sh --zookeeper $zk_loc --topic $output_topic --delete >&2 
 
 	sleep 10
-	echo "Create topic"
+	echo "Create topic" >&2
 
 
-	./kafka/bin/kafka-topics.sh --create --zookeeper $zk_loc  --topic $input_topic --partitions $p --replication-factor 1
+	./kafka/bin/kafka-topics.sh --create --zookeeper $zk_loc  --topic $input_topic --partitions $p --replication-factor 1 >&2
 
-	./kafka/bin/kafka-topics.sh --create --zookeeper $zk_loc  --topic $output_topic --partitions $p --replication-factor 1 
-	echo "Done creating"
+	./kafka/bin/kafka-topics.sh --create --zookeeper $zk_loc  --topic $output_topic --partitions $p --replication-factor 1  >&2
+	echo "Done creating" >&2 
 
+	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --add-config retention.ms=30000 --entity-name $input_topic >&2
+	./kafka/bin/kafka-configs.sh --zookeeper $zk_loc --alter --entity-type topics --add-config retention.ms=30000 --entity-name $output_topic >&2
 	sleep 5
 
 }
 
 kill_taskmanager() {
 
+    	local jobid=$1
+	local path=$2
+    	local depth_to_kill=$3
 	# Get taskmanagers used by job
-	response=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$1")
-	vertex_ids=($(echo $response | jq '.vertices[] | .id'  |  tr -d '"'))
+	local response=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$1")
+	local vertex_ids=($(echo $response | jq '.vertices[] | .id'  |  tr -d '"'))
 	echo "Vertexes used: ${vertex_ids[@]}"
 
-	taskmanagers_used=($(for vid in ${vertex_ids[@]} ; do curl -sS -X GET "http://0.0.0.0:31234/jobs/$1/vertices/$vid/taskmanagers" | jq '.taskmanagers[] | .host'  |  tr -d '"' | tr ":" " " | awk {'print $1'}  ; done))
+	local taskmanagers_used=($(for vid in ${vertex_ids[@]} ; do curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/$vid/taskmanagers" | jq '.taskmanagers[] | .host'  |  tr -d '"' | tr ":" " " | awk {'print $1'}  ; done))
 	echo "Taskmanagers used: ${taskmanagers_used[@]}"
 
 	# Kill the zeroeth tm of subtask of index to kill
-	taskmanager_to_kill=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$1/vertices/${vertex_ids[$index_to_kill]}/subtasks/0" | jq '.host' |  tr -d '"')
+	local taskmanager_to_kill=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[$depth_to_kill]}/subtasks/0" | jq '.host' |  tr -d '"')
 
-	kill_time=$(( $(date '+%s%N') / 1000000))
-	echo $kill_time > $2/killtime
-	echo "Killing taskmanager $taskmanager_to_kill at $kill_time"
+	local kill_time=$(( $(date '+%s%N') / 1000000))
 	kubectl delete pod $taskmanager_to_kill
+	echo "Kiled taskmanager $taskmanager_to_kill at $kill_time"
+	echo $kill_time > $path/killtime
 
 }
 
 push_job() {
-    echo "Pushing job to Flink"
-	response=$(curl -sS -X POST -H "Expect:" -F "jarfile=@job-marios.jar" http://0.0.0.0:31234/jars/upload)
-	echo "Job submit: $response"
-	id=$(echo $response | jq '.filename' |  tr -d '"' | tr "/" "\n" | tail -n1)
-	return $id
+    local response=$(curl -sS -X POST -H "Expect:" -F "jarfile=@job-marios.jar" http://0.0.0.0:31234/jars/upload)
+    echo "$response" >&2
+    local id=$(echo $response | jq '.filename' |  tr -d '"' | tr "/" "\n" | tail -n1)
+    echo "$id"
 }
 
 measure_sustainable_throughput() {
-    ss=$1
-	cf=$2
-	p=$3
-	g=$4
+    local cf=$1
+    local ss=$2
+    local p=$3
+    local d=$4
+    local st=$5
+    local as=$6
+    local fg=$7
 
-    id=$(push_job)
-    
-    response=$(curl -sS  -X POST --header "Content-Type: application/json;charset=UTF-8" --data "{\"programArgs\":\"--bootstrap.servers $kafka_bootstrap --experiment-state-size $ss --experiment-checkpoint-interval-ms $cf --experiment-state-fragment-size $frag_size --experiment-depth $g --experiment-parallelism $p --sleep $sleep_time\"}" "http://0.0.0.0:31234/jars/$id/run?allowNonRestoredState=false")
+        echo "Run experiment configuration:" >&2
+        echo "   Graph topology: Source - $d operators - Sink" >&2
+        echo "   Parallelism degree: $p" >&2
+        echo "   State: $ss bytes" >&2
+        echo "   Frag Size: $fg bytes" >&2
+        echo "   Checkpoint frequency: $cf milliseconds" >&2
+        echo "   Sleep time: $st milliseconds" >&2
+        echo "   Access state: $as" >&2
+        echo "   Input rate: Sustainable" >&2
+	echo "Kafka $kafka_bootstrap" >&2
 
-    echo "Job run: $response"
-     ./distributed-producer.sh 120 5 2000000 $kafka_ext $input_topic  $benchmarkers &
-    sleep 50
-    max1=$(python3 ./throughput-measurer/Main.py  20 2 $kafka_ext $output_topic silent)
-    echo "Max1 at $max1 r/s"
-    max2=$(python3 ./throughput-measurer/Main.py  20 2 $kafka_ext $output_topic silent)
-    echo "Max2 at $max2 r/s"
-    max3=$(python3 ./throughput-measurer/Main.py  20 2 $kafka_ext $output_topic silent)
-    echo "Max3 at $max3 r/s"
-    max=$(echo -e "$max1\n$max2\n$max3" | sort -n -r | head -n1)
-    echo "Max at $max r/s"
+   
+    clear_make_topics $p
+    local id=$(push_job)
     
-    jobid=$(curl -sS -X GET "http://0.0.0.0:31234/jobs" |  jq  '.jobs[0].id' | tr -d '"')
-    echo "Canceling the job with id $jobid"
-    curl -sS -X PATCH "http://0.0.0.0:31234/jobs/$jobid?mode=cancel"
+    response=$(curl -sS  -X POST --header "Content-Type: application/json;charset=UTF-8" --data "{\"programArgs\":\"--bootstrap.servers $kafka_bootstrap --experiment-state-size $ss --experiment-checkpoint-interval-ms $cf --experiment-state-fragment-size $fg --experiment-access-state $as --experiment-depth $d --experiment-parallelism $p --sleep $st\"}" "http://0.0.0.0:31234/jars/$id/run?allowNonRestoredState=false")
+    echo "$response" >&2
+    sleep 15
+
+     ./distributed-producer.sh 230 5 10000000 $kafka_ext $input_topic  $benchmarkers >&2 & 
+    sleep 60
+    local max1=$(python3 ./throughput-measurer/Main.py  20 1 $kafka_ext $output_topic silent)
+    echo "measure 1 $max1" >&2
+    local max2=$(python3 ./throughput-measurer/Main.py  20 1 $kafka_ext $output_topic silent)
+    echo "measure 2 $max2" >&2
+    local max3=$(python3 ./throughput-measurer/Main.py  20 1 $kafka_ext $output_topic silent)
+    echo "measure 3 $max3" >&2
+    local maxin=$(python3 ./throughput-measurer/Main.py  20 1 $kafka_ext $input_topic silent)
+    echo "measure input $maxin" >&2
+    local max4=$(python3 ./throughput-measurer/Main.py  20 1 $kafka_ext $output_topic silent)
+    echo "measure 4 $max4" >&2
+    local max5=$(python3 ./throughput-measurer/Main.py  20 1 $kafka_ext $output_topic silent)
+    echo "measure 5 $max5" >&2
+    local max6=$(python3 ./throughput-measurer/Main.py  20 1 $kafka_ext $output_topic silent)
+    echo "measure 6 $max6" >&2
+    local max7=$(python3 ./throughput-measurer/Main.py  20 1 $kafka_ext $output_topic silent)
+    echo "measure 7 $max7" >&2
+
+    local max=$(echo -e "$max1\n$max2\n$max3\n$max4\n$max5\n$max6\n$max7" | sort -n -r | head -n1)
     
-    kubectl delete pod $(kubectl get pod | grep flink | awk {'print $1'})
-	return $max
+    local jobid=$(curl -sS -X GET "http://0.0.0.0:31234/jobs" |  jq  '.jobs[0].id' | tr -d '"')
+    curl -sS -X PATCH "http://0.0.0.0:31234/jobs/$jobid?mode=cancel" > /dev/null
+    sleep 3
+    
+    kubectl delete pod $(kubectl get pod | grep flink | awk {'print $1'})  >&2
+    sleep 30
+    echo "$max"
 }
 
 run_experiment() {
-    ss=$1
-	cf=$2
-	p=$3
-	g=$4
-	setting=$5
-	path=$6
+	local cf=$1
+    local ss=$2
+	local p=$3
+	local d=$4
+	local setting=$5
+	local max=$6
+	local path=$7
+	local depth_to_kill=$8
+	local st=$9
+	local as=${10}
+	local fg=${11}
 
-	clear_make_topics
-    id=$(push_job)
+        echo "Run experiment configuration:"
+        echo "   Graph topology: Source - $d operators - Sink"
+        echo "   Parallelism degree: $p"
+        echo "   State: $ss bytes"
+        echo "   Frag Size: $fg bytes"
+        echo "   Checkpoint frequency: $cf milliseconds"
+        echo "   Kill depth: $kd"
+        echo "   Sleep time: $st milliseconds"
+        echo "   Access state: $as"
+        echo "   Input rate: Sustainable"
 
-	sustainable=$(echo "$setting * $max" | bc)
-	echo "Setting throughput at $sustainable r/s"
+        echo "   Path: $path"
+        echo "   Max: $max"
+        echo "   setting: $setting"
+
+
+
+	clear_make_topics $p
+    id=$( push_job )
+
+	local sustainable=$(echo "$setting * $max" | bc)
+	echo "Setting throughput at $sustainable r/s" >&2
 	mkdir -p $path/$setting
 	echo $sustainable > $path/$setting/sustainable
 
-	response=$(curl -sS  -X POST --header "Content-Type: application/json;charset=UTF-8" --data "{\"programArgs\":\"--bootstrap.servers $kafka_bootstrap --experiment-state-size $ss --experiment-state-fragment-size $frag_size --experiment-checkpoint-interval-ms $cf --experiment-depth $g --experiment-parallelism $p --sleep $sleep_time\"}" "http://0.0.0.0:31234/jars/$id/run?allowNonRestoredState=false")
+	response=$(curl -sS  -X POST --header "Content-Type: application/json;charset=UTF-8" --data "{\"programArgs\":\"--bootstrap.servers $kafka_bootstrap --experiment-state-size $ss --experiment-state-fragment-size $fg --experiment-access-state $as --experiment-checkpoint-interval-ms $cf --experiment-depth $d --experiment-parallelism $p --sleep $st\"}" "http://0.0.0.0:31234/jars/$id/run?allowNonRestoredState=false")
 	echo "Job run: $response"
-	sleep 5
-	jobid=$(curl -sS -X GET "http://0.0.0.0:31234/jobs" |  jq  '.jobs[0].id' | tr -d '"')
+	sleep 15
+	local jobid=$(curl -sS -X GET "http://0.0.0.0:31234/jobs" |  jq  '.jobs[0].id' | tr -d '"')
 
-	. ./distributed-producer.sh 200 5 $sustainable $kafka_ext $input_topic  $benchmarkers &
-	sleep 45
-	python3 ./throughput-measurer/Main.py  150 3 $kafka_ext $output_topic verbose > $path/$setting/throughput &
-    . ./latmeasurer.sh $jobid 0.1 1500 $g >> $path/$setting/latmeasured &
+	. ./distributed-producer.sh 200 5 $sustainable $kafka_ext $input_topic  $benchmarkers > /dev/null &
+	sleep 60
+	python3 ./throughput-measurer/Main.py  120 3 $kafka_ext $output_topic verbose > $path/$setting/throughput &
+    . ./latmeasurer.sh $jobid 0.1 1200 $d >> $path/$setting/latmeasured &
 
-	sleep 50
-	kill_taskmanager $jobid $path/$setting
-	sleep 115
+	sleep 60
+	kill_taskmanager $jobid $path/$setting $depth_to_kill
+    local maxin=$(python3 ./throughput-measurer/Main.py  20 1 $kafka_ext $input_topic silent)
+    echo "measure input $maxin" >&2
+	sleep 60
 
 	response=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid")
 	vertex_ids=($(echo $response | jq '.vertices[] | .id'  |  tr -d '"'))
 
 	echo "Saving logs"
-	jobmanager=$(kubectl get pods | grep jobmanager | awk '{print $1}')
-	new_host=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[$index_to_kill]}/subtasks/0" | jq '.host' |  tr -d '"')
-	src_pod=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[0]}/subtasks/0" | jq '.host' |  tr -d '"')
-	sink_pod=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[$(( $g + 1 ))]}/subtasks/0" | jq '.host' |  tr -d '"')
+	local jobmanager=$(kubectl get pods | grep jobmanager | awk '{print $1}')
+	local new_host=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[$depth_to_kill]}/subtasks/0" | jq '.host' |  tr -d '"')
+	local src_pod=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[0]}/subtasks/0" | jq '.host' |  tr -d '"')
+	local sink_pod=$(curl -sS -X GET "http://0.0.0.0:31234/jobs/$jobid/vertices/${vertex_ids[$(( $d + 1 ))]}/subtasks/0" | jq '.host' |  tr -d '"')
 
 	echo "Canceling the job with id $jobid"
 	curl -sS -X PATCH "http://0.0.0.0:31234/jobs/$jobid?mode=cancel"
+
 
 	kubectl logs $jobmanager > $path/$setting/JOBMANAGER-LOGS
 	kubectl logs $new_host > $path/$setting/STANDBY-LOGS
 	kubectl logs $src_pod > $path/$setting/SRC-LOGS
 	kubectl logs $sink_pod > $path/$setting/SINK-LOGS
 
-	mkdir -p $path/$setting/logs
-	for pod in $(kubectl get pod | grep flink | awk {'print $1'}) ; do kubectl logs $pod > $path/$setting/logs/$pod ; done
+	#mkdir -p $path/$setting/logs
+	#for pod in $(kubectl get pod | grep flink | awk {'print $1'}) ; do kubectl logs $pod > $path/$setting/logs/$pod ; done
 
 	kubectl delete pod $(kubectl get pod | grep flink | awk {'print $1'})
 
@@ -189,41 +264,59 @@ run_experiment() {
 
 
 echo "Beggining experiments"
-#Start Benchmark
-for cf in ${checkpoint_frequencies[@]} ; do
-    mkdir -p $results/cf-$cf
-    for ss in ${state_sizes[@]} ; do
-        mkdir -p $results/cf-$cf/ss-$ss
-		for p in ${parallelism_degrees[@]} ; do
-		    mkdir -p $results/cf-$cf/ss-$ss/par-$p
-			for g in ${graph_depths[@]} ; do
-		        mkdir -p $results/cf-$cf/ss-$ss/par-$p/dep-$g
-				for a in $(seq 1 $attempts) ; do
-		            mkdir -p $results/cf-$cf/ss-$ss/par-$p/dep-$g/attempt-$a
-				    path=$results/cf-$cf/ss-$ss/par-$p/dep-$g/attempt-$a
-					clear_make_topics
-
-					echo "Run experiment configuration:"
-					echo "   Graph topology: Source - $g operators - Sink"
-					echo "   Parallelism degree: $p"
-					echo "   State: $ss bytes"
-					echo "   Checkpoint frequency: $c milliseconds"
-					echo "   Input rate: Pull rate"
 
 
-					max=$(measure_sustainable_throughput $cf $ss $p $g)
+for job in "${work_queue[@]}"
+do
+    IFS=";" read -r -a arr <<< "${job}"
 
-					########## Run throughput experiment
+    cf="${arr[0]}"
+    ss="${arr[1]}"
+    p="${arr[2]}"
+    d="${arr[3]}"
+    kd="${arr[4]}"
+    st="${arr[5]}"
+    as="${arr[6]}"
+    fg="${arr[7]}"
 
-				    run_experiment $cf $ss $p $g 0.9 $path
-					
+    for a in $(seq 1 $attempts) ; do #attempt
+        path=$results/cf-$cf/ss-$ss/par-$p/dep-$d/kill-$kd/sleep-$st/as-$as/attempt-$a
+        mkdir -p $path
 
+        echo "Run experiment configuration:"
+        echo "   Graph topology: Source - $d operators - Sink"
+        echo "   Parallelism degree: $p"
+        echo "   State: $ss bytes"
+        echo "   Frag Size: $fg bytes"
+        echo "   Checkpoint frequency: $cf milliseconds"
+        echo "   Kill depth: $kd"
+        echo "   Sleep time: $st milliseconds"
+        echo "   Access state: $as"
+        echo "   Input rate: Sustainable"
 
-					########## Run latency experiment
-				    run_experiment $cf $ss $p $g 0.5 $path
+  		max=$( measure_sustainable_throughput $cf $ss $p $d $st $as $fg )
+  		echo -e "Maximum throughput: $max records/second"
 
-				done
-			done
-		done
-	done
+		sleep 15
+
+  		########### Run throughput experiment
+
+  		echo -e "\n\nRunning setting 0.9"
+
+  		run_experiment $cf $ss $p $d 0.9 $max $path $kd $st $as $fg
+  		 	
+		sleep 10
+
+  		echo -e "\n\nRunning setting 0.5"
+
+  		########### Run latency experiment
+  		run_experiment $cf $ss $p $d 0.5 $max $path $kd $st $as $fg
+
+		#for pod in $(kubectl get pod | grep flink | awk {'print $1'}) ; do kubectl logs $pod > $path/logs/$pod ; done
+
+		#kubectl delete pod $(kubectl get pod | grep flink | awk {'print $1'})
+		sleep 10
+
+        done
 done
+

@@ -1,0 +1,4 @@
+StatefulMapperJob/project/target/*
+StatefulMapperJob/.idea/*
+throughput-measurer/venv/*
+

@@ -2,30 +2,26 @@
 
 function poll() {
 	local sleep=$1
-	shift 1
-	local pods=("$@")
+	local vertex=$2
+	local local_experiment=$3
 
 	while true; do
 		ts=$(( $(date '+%s%N') / 1000000))
-		for pod in "${pods[@]}" ; do
-			echo -e "$ts \t $(kubectl exec $pod cat /proc/net/dev | grep eth0 | awk {'print $2 "\t" $10'})" 
-		done
+		if [ "$local_experiment" = "false" ]; then
+		  echo -e "$ts\t$(kubectl exec $pod cat /proc/net/dev | grep eth0 | awk {'print $2 "\t" $10'})"
+		else
+		  echo -e "$ts\t$(docker exec $pod cat /proc/net/dev | grep eth0 | awk {'print $2 "\t" $10'})"
+		fi
 		sleep "$sleep"s
 	done
 }
 
 duration_sec=$1
-shift 1
-pods=("$@")
+vertex=$2
+local_experiment=$3
+sleep="0.5"
 
-sleep=$(echo "scale=2 ; 1 - 0.3 * ${#pods[@]}" | bc)
-
-
-
-
-for pod in "${pods[@]}" ; do 
-	echo -e "TIME \t RX \t TX"  
-done 
+echo -e "TIME\tRX\tTX"
 
 export -f poll
-timeout "$duration_sec"s bash -c "poll $sleep $(echo $@)"
+timeout "$duration_sec"s bash -c "poll $sleep $vertex $local_experiment"

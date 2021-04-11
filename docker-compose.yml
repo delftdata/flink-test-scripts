@@ -1,0 +1,129 @@
+version: "2.1"
+
+services:
+#====================== Kafka =================================
+#  zookeeper:
+#    image: wurstmeister/zookeeper
+#    mem_limit: 512m
+#    mem_reservation: 512m
+#    cpus: 0.5
+#    ports:
+#      - "2181:2181"
+#  kafka:
+#    image: wurstmeister/kafka:2.11-0.11.0.3
+#    mem_limit: 1024m
+#    mem_reservation: 1024m
+#    cpus: 1
+#    ports:
+#      - "9092:9092"
+#    links: 
+#      - "zookeeper:zookeeper"
+#    environment:
+#      KAFKA_ADVERTISED_HOST_NAME: 172.17.0.1
+#      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+#      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+#      KAFKA_DELETE_TOPIC_ENABLE: 'true'
+#      KAFKA_MAX_TRANSACTION_TIMEOUT_MS: 3600000
+#      KAFKA_TRANSACTION_MAX_TIMEOUT_MS: 3600000
+#      KAFKA_LOG_MESSAGE_TIMESTAMP_TYPE: 'LogAppendTime'
+#    volumes:
+#      - /var/run/docker.sock:/var/run/docker.sock
+#    depends_on:
+#      - zookeeper
+#================== Flink ====================================
+  jobmanager:
+    image: psylvan/clonos
+    mem_limit: 1024m
+    mem_reservation: 1024m
+    cpus: 1
+    expose:
+      - "6123"
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    depends_on:
+      - namenode
+    links:
+      - namenode:hdfs-namenode
+    volumes:
+      - ./flink-conf.yaml:/opt/flink/conf/flink-conf.yaml
+      - ./log4j-console.properties:/opt/flink/conf/log4j-console.properties
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+  taskmanager:
+    image: psylvan/clonos
+    mem_limit: 1024m
+    mem_reservation: 1024m
+    cpus: 1
+    expose:
+      - "6121"
+      - "6122"
+      - "8849"
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    volumes:
+      - ./flink-conf.yaml:/opt/flink/conf/flink-conf.yaml
+      - ./log4j-console.properties:/opt/flink/conf/log4j-console.properties
+    links:
+      - jobmanager:jobmanager
+      - namenode:hdfs-namenode
+    environment:
+       JOB_MANAGER_RPC_ADDRESS: jobmanager
+       #FLINK_ENV_JAVA_OPTS: '-agentpath:/usr/local/jprofiler11.1.3/bin/linux-x64/libjprofilerti.so=nowait'
+       # ================ HDFS ===========================================
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    mem_limit: 1024m
+    mem_reservation: 1024m
+    cpus: 1
+    container_name: namenode
+    restart: always
+    ports:
+      - 9870:9870
+      - 9000:9000
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    environment:
+      - CLUSTER_NAME=test
+    env_file:
+      - ./hadoop.env
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    mem_limit: 1024m
+    mem_reservation: 1024m
+    cpus: 1
+    container_name: datanode
+    restart: always
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    env_file:
+      - ./hadoop.env
+volumes:
+  hadoop_namenode:
+  hadoop_datanode:
+
+
+
+#
+#  namenode:
+#    image: psylvan/hadoop
+#    ports: 
+#        - "50070:50070"
+#    command: hdfs namenode
+#    hostname: hdfs-namenode
+#    volumes:
+#      - "./conf:/usr/local/hadoop/etc/hadoop/conf"
+#
+#  datanode:
+#    image: psylvan/hadoop
+#    command: hdfs datanode
+#    volumes:
+#      - "./conf:/usr/local/hadoop/etc/hadoop/conf"
+#    ports:
+#        - "50075"
+#    links:
+#        - namenode:hdfs-namenode

@@ -1,12 +1,6 @@
-import threading
 import time
 import uuid
-from datetime import datetime
-import json
-from random import randint, random, seed
-#import numpy as np
 import sys
-from confluent_kafka.cimpl import Producer, KafkaError
 from confluent_kafka.cimpl import Consumer
 import statistics
 
@@ -22,7 +16,8 @@ def exec_benchmark(duration_s, fps, kafka_loc, output_topic, silent):
         'bootstrap.servers': kafka_loc,
         'group.id': 'benchmark-' + str(uuid.uuid4()),
         'auto.offset.reset': 'latest',
-        'max.poll.interval.ms': 86400000
+        'max.poll.interval.ms': 86400000,
+        'isolation.level': 'read_committed'
     })
 
     # === Get topic partitions
@@ -48,8 +43,8 @@ def exec_benchmark(duration_s, fps, kafka_loc, output_topic, silent):
         low, high = c.get_watermark_offsets(p)
         throughput_measured_per_partition[p.partition] = []
         last_values[p.partition] = high
-        if silent != "silent":
-            print("Starting value for partition {}: {}".format(p.partition, high))
+        #if silent != "silent":
+        #    print("Starting value for partition {}: {}".format(p.partition, high))
 
     MS_PER_UPDATE = 1000 / fps
 
@@ -69,25 +64,34 @@ def exec_benchmark(duration_s, fps, kafka_loc, output_topic, silent):
             #calc new val
             total_new = 0
             curr_time_for_print = current_milli_time()
-            for p in topic_partitions:
-                low, high = c.get_watermark_offsets(p)
-                delta = high - last_values[p.partition]
-                total_new += delta
-                throughput_measured_per_partition[p.partition].append((delta / ((curr_time_for_print - last_write_time)/1000), curr_time_for_print))
-                last_values[p.partition] = high
-            throughput_measured.append((total_new / ((curr_time_for_print - last_write_time)/1000), curr_time_for_print))
-            last_write_time = curr_time_for_print
+            time_delta=((curr_time_for_print - last_write_time)/1000)
+            if time_delta > 0:
+                for p in topic_partitions:
+                    low, high = c.get_watermark_offsets(p)
+                    delta = high - last_values[p.partition]
+                    total_new += delta
+                    throughput_measured_per_partition[p.partition].append((delta / time_delta , curr_time_for_print))
+                    last_values[p.partition] = high
+                throughput_measured.append((total_new / time_delta, curr_time_for_print))
+                last_write_time = curr_time_for_print
 
             lag -= MS_PER_UPDATE
 
 
     if silent != "silent":
-        print(str(throughput_measured))
-        print("\n")
-        for p in topic_partitions:
-            print(str(p.partition) + ": " + str(throughput_measured_per_partition[p.partition]))
-
-    print(int(statistics.mean([x[0] for x in throughput_measured if x[0] > 0.0])))
+        #Print column names
+        #TIME THROUGHPUT PART-0 ... PART-N
+        columns = "TIME\tTHROUGHPUT"
+        for i in range(len(topic_partitions)):
+            columns += "\tPART-{}".format(str(i))
+        print(columns)
+        for row in range(len(throughput_measured)):
+            row_data = "{}\t{}".format(throughput_measured[row][1], int(throughput_measured[row][0]))
+            for i in range(len(topic_partitions)):
+                row_data+= "\t{}".format(int(throughput_measured_per_partition[i][row][0]))
+            print(row_data)
+    else:
+        print(int(statistics.mean([x[0] for x in throughput_measured if x[0] > 0.0])))
 
 def main():
     if len(sys.argv) != 6:

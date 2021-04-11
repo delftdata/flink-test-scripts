@@ -2,7 +2,11 @@
 
 A set of bash scripts that repeatedly execute a native example from Flink's code base, kill a task manager, and check whether the job resumes successfully.
 
-The main script is run-recovery-experiment.sh. This script can be used to launch sequences of complex experiments and record the results.
+The main script is run-recovery-experiment.sh. 
+This script can be used to launch sequences of complex experiments and record the results.
+These experiments are enabled by a highly configurable synthetic job, whose parameters can be set at runtime. The job is included in both source (StatefulMapperJob) and as a jar (job-clonos.jar).
+
+
 
 ### Graph only vs. external Kafka generators
 
